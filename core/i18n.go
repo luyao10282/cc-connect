@@ -255,6 +255,10 @@ const (
 	MsgListSwitchHint            MsgKey = "list_switch_hint"
 	MsgListError                 MsgKey = "list_error"
 	MsgHistoryEmpty              MsgKey = "history_empty"
+	MsgLastEmpty                 MsgKey = "last_empty"
+	MsgLastHeader                MsgKey = "last_header"
+	MsgLastPrompt                MsgKey = "last_prompt"
+	MsgLastReadError             MsgKey = "last_read_error"
 	MsgNameUsage                 MsgKey = "name_usage"
 	MsgNameSet                   MsgKey = "name_set"
 	MsgNameNoSession             MsgKey = "name_no_session"
@@ -591,6 +595,7 @@ const (
 	MsgBuiltinCmdName      MsgKey = "name"
 	MsgBuiltinCmdCurrent   MsgKey = "current"
 	MsgBuiltinCmdHistory   MsgKey = "history"
+	MsgBuiltinCmdLast      MsgKey = "last"
 	MsgBuiltinCmdProvider  MsgKey = "provider"
 	MsgBuiltinCmdMemory    MsgKey = "memory"
 	MsgBuiltinCmdAllow     MsgKey = "allow"
@@ -1509,6 +1514,34 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "當前會話暫無歷史訊息。",
 		LangJapanese:           "現在のセッションに履歴がありません。",
 		LangSpanish:            "No hay historial en la sesión actual.",
+	},
+	MsgLastEmpty: {
+		LangEnglish:            "No assistant reply in this session yet.",
+		LangChinese:            "当前会话还没有任何回答。",
+		LangTraditionalChinese: "當前會話還沒有任何回覆。",
+		LangJapanese:           "このセッションにはまだ回答がありません。",
+		LangSpanish:            "Aún no hay respuestas en esta sesión.",
+	},
+	MsgLastHeader: {
+		LangEnglish:            "🤖 Last reply · %s · %s",
+		LangChinese:            "🤖 最后回答 · %s · %s",
+		LangTraditionalChinese: "🤖 最後回覆 · %s · %s",
+		LangJapanese:           "🤖 直近の回答 · %s · %s",
+		LangSpanish:            "🤖 Última respuesta · %s · %s",
+	},
+	MsgLastPrompt: {
+		LangEnglish:            "👤 Asked: %s",
+		LangChinese:            "👤 提问: %s",
+		LangTraditionalChinese: "👤 提問: %s",
+		LangJapanese:           "👤 質問: %s",
+		LangSpanish:            "👤 Pregunta: %s",
+	},
+	MsgLastReadError: {
+		LangEnglish:            "⚠️ Could not read the session transcript: %v",
+		LangChinese:            "⚠️ 读取会话记录失败: %v",
+		LangTraditionalChinese: "⚠️ 讀取會話記錄失敗: %v",
+		LangJapanese:           "⚠️ セッション記録の読み取りに失敗しました: %v",
+		LangSpanish:            "⚠️ No se pudo leer el registro de la sesión: %v",
 	},
 	MsgNameUsage: {
 		LangEnglish:            "Usage:\n`/name <text>` — name the current session\n`/name <number> <text>` — name a session by list number",
@@ -3654,6 +3687,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "查看最近 n 條訊息，參數: [n]（預設 10）",
 		LangJapanese:           "直近 n 件のメッセージを表示、引数: [n]（デフォルト 10）",
 		LangSpanish:            "Mostrar últimos n mensajes, arg: [n] (por defecto 10)",
+	},
+	MsgBuiltinCmdLast: {
+		LangEnglish:            "Replay the last full reply, arg: [n] (default 1)",
+		LangChinese:            "复现最后一条完整回答，参数: [n]（默认 1）",
+		LangTraditionalChinese: "重現最後一則完整回覆，參數: [n]（預設 1）",
+		LangJapanese:           "直近の回答を全文で再表示、引数: [n]（デフォルト 1）",
+		LangSpanish:            "Repetir la última respuesta completa, arg: [n] (por defecto 1)",
 	},
 	MsgBuiltinCmdProvider: {
 		LangEnglish:            "Manage API providers, arg: [list|add|remove|switch|clear]",
