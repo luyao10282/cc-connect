@@ -673,6 +673,12 @@ func extractStringContent(raw json.RawMessage) string {
 	return s
 }
 
+// maxTranscriptLineBytes bounds a single JSONL record when reading Claude Code
+// transcripts. One record holds a whole tool_result, so real sessions do exceed
+// a few hundred KB; bufio.Scanner stops silently at the first oversized line,
+// which used to make everything after it invisible to /list and /history.
+const maxTranscriptLineBytes = 8 * 1024 * 1024
+
 func scanSessionMeta(path string) (string, int) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -681,7 +687,7 @@ func scanSessionMeta(path string) (string, int) {
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	scanner.Buffer(make([]byte, 64*1024), maxTranscriptLineBytes)
 
 	var firstUserMessage string
 	var aiTitle string
@@ -778,7 +784,7 @@ func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int
 
 	var entries []core.HistoryEntry
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	scanner.Buffer(make([]byte, 64*1024), maxTranscriptLineBytes)
 
 	for scanner.Scan() {
 		var raw struct {
@@ -807,6 +813,12 @@ func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int
 			Content:   text,
 			Timestamp: ts,
 		})
+	}
+
+	// A scan error means the tail of the transcript was never read, so the
+	// "latest" entry would silently be a stale one. Report it instead.
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("claudecode: read session file: %w", err)
 	}
 
 	if limit > 0 && len(entries) > limit {
