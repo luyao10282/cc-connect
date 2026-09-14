@@ -83,6 +83,13 @@ type claudeSession struct {
 	// construction time and never mutates it afterwards.
 	ctxWindowOverride int
 
+	// reportedWindow is the context window (tokens) the CLI itself reported
+	// for the active model in a result event's modelUsage map. Zero until
+	// the first result arrives; claudeContextWindow() guesses from the model
+	// id until then. The CLI knows the real window (e.g. 1M for Fable) while
+	// the id-based guess only recognises the "[1m]" suffix.
+	reportedWindow atomic.Int64
+
 	// gracefulStopTimeout is how long Close() waits for a clean exit
 	// (stdin close → Stop hooks → process exit) before escalating to
 	// SIGTERM and then SIGKILL. Default: 120s to match claude-mem's
@@ -980,8 +987,10 @@ func (cs *claudeSession) handleAssistant(raw map[string]any) {
 		input, _, cc, cr := parseClaudeUsage(usageRaw)
 		used := input + cc + cr
 		if used > 0 {
-			model := cs.GetModel()
-			window := claudeContextWindow(model, cs.ctxWindowOverride)
+			window := int(cs.reportedWindow.Load())
+			if window <= 0 {
+				window = claudeContextWindow(cs.GetModel(), cs.ctxWindowOverride)
+			}
 			cs.usageMu.Lock()
 			prevOutput := 0
 			if cs.lastUsage != nil {
@@ -1164,6 +1173,16 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 	if usage, ok := raw["usage"].(map[string]any); ok {
 		inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens = parseClaudeUsage(usage)
 	}
+	// The result's modelUsage map carries the authoritative contextWindow
+	// per model. Remember it so later per-call snapshots and the current
+	// one stop relying on the "[1m]"-suffix guess.
+	window := 0
+	if mu, ok := raw["modelUsage"].(map[string]any); ok {
+		window = contextWindowFromModelUsage(mu, cs.GetModel())
+	}
+	if window > 0 {
+		cs.reportedWindow.Store(int64(window))
+	}
 
 	// Path 2: consult the transcript when the in-process snapshot is absent.
 	cs.usageMu.Lock()
@@ -1185,11 +1204,16 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 		// aggregate — that substitution is what produced the overestimate.
 	}
 
-	if outputTokens > 0 {
+	if outputTokens > 0 || window > 0 {
 		cs.usageMu.Lock()
 		if cs.lastUsage != nil {
-			cs.lastUsage.OutputTokens = outputTokens
-			cs.lastUsage.TotalTokens = cs.lastUsage.UsedTokens + outputTokens
+			if outputTokens > 0 {
+				cs.lastUsage.OutputTokens = outputTokens
+				cs.lastUsage.TotalTokens = cs.lastUsage.UsedTokens + outputTokens
+			}
+			if window > 0 {
+				cs.lastUsage.ContextWindow = window
+			}
 		}
 		cs.usageMu.Unlock()
 	}
@@ -1672,10 +1696,11 @@ func shellJoinArgs(args []string) string {
 }
 
 // claudeContextWindow returns the context window size (tokens) that best
-// matches the given Claude model id. Used as a fallback when the stream-json
-// result event does not carry a modelUsage map. The "[1m]" suffix
-// (case-insensitive) signals the 1M-context variants; everything else
-// defaults to the standard 200k window.
+// matches the given Claude model id. Used as a fallback until a stream-json
+// result event carries a modelUsage map (see contextWindowFromModelUsage).
+// The "[1m]" suffix (case-insensitive) signals the 1M-context variants and
+// the Fable family is 1M natively; everything else defaults to the standard
+// 200k window.
 // override (set from `[projects.agent.options].context_window_tokens`)
 // wins over the model-name heuristic when > 0. This lets operators pin a
 // specific window size for custom routers, fine-tuned models, or non-Claude
@@ -1688,10 +1713,40 @@ func claudeContextWindow(model string, override int) int {
 	if lower == "" {
 		return 200_000
 	}
-	if strings.Contains(lower, "[1m]") {
+	if strings.Contains(lower, "[1m]") || strings.Contains(lower, "fable") {
 		return 1_000_000
 	}
 	return 200_000
+}
+
+// contextWindowFromModelUsage picks the context window the CLI reported for
+// the active model out of a result event's modelUsage map
+// ({"<model-id>": {"contextWindow": N, ...}, ...}). The map also lists helper
+// models (e.g. Haiku for title generation), so when `model` does not match a
+// key exactly the largest window wins: helpers are never larger than the
+// main model. Returns 0 when nothing usable is present.
+func contextWindowFromModelUsage(modelUsage map[string]any, model string) int {
+	want := strings.ToLower(strings.TrimSpace(model))
+	// "[1m]" is a CLI alias suffix; the map is keyed by the bare model id.
+	want = strings.TrimSuffix(want, "[1m]")
+	best := 0
+	for id, v := range modelUsage {
+		entry, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		cw, ok := entry["contextWindow"].(float64)
+		if !ok || cw <= 0 {
+			continue
+		}
+		if want != "" && strings.ToLower(id) == want {
+			return int(cw)
+		}
+		if int(cw) > best {
+			best = int(cw)
+		}
+	}
+	return best
 }
 
 // filterEnv returns a copy of env with entries matching the given key removed.

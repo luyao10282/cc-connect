@@ -1440,5 +1440,103 @@ func TestHandleResultKeepsLiveAssistantUsage(t *testing.T) {
 	}
 	if u.OutputTokens != 406 {
 		t.Errorf("OutputTokens = %d, want 406 (result is authoritative for output)", u.OutputTokens)
+// A model id without the "[1m]" suffix used to be assumed 200k even when the
+// CLI's result event said otherwise, so a Fable session past 200k rendered
+// ctx 100%. The reported window must win over the id-based guess, both for
+// the snapshot already taken and for later per-call snapshots.
+func TestHandleResultAdoptsReportedContextWindow(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cs := &claudeSession{
+		events: make(chan core.Event, 8),
+		ctx:    ctx,
+	}
+	cs.sessionID.Store("test-session")
+	cs.alive.Store(true)
+	cs.activeModel.Store("claude-nova-9") // unknown family, no suffix -> guessed 200k
+
+	assistant := map[string]any{
+		"type": "assistant",
+		"message": map[string]any{
+			"content": []any{},
+			"usage": map[string]any{
+				"input_tokens":                float64(32),
+				"output_tokens":               float64(1),
+				"cache_creation_input_tokens": float64(3_000),
+				"cache_read_input_tokens":     float64(250_000),
+			},
+		},
+	}
+	cs.handleAssistant(assistant)
+	if got := cs.GetContextUsage().ContextWindow; got != 200_000 {
+		t.Fatalf("before result: ContextWindow = %d, want guessed 200_000", got)
+	}
+
+	cs.handleResult(map[string]any{
+		"type":  "result",
+		"usage": map[string]any{"output_tokens": float64(900)},
+		"modelUsage": map[string]any{
+			"claude-haiku-4-5-20251001": map[string]any{"contextWindow": float64(200_000)},
+			"claude-nova-9":             map[string]any{"contextWindow": float64(1_000_000)},
+		},
+	})
+	usage := cs.GetContextUsage()
+	if usage.ContextWindow != 1_000_000 {
+		t.Errorf("after result: ContextWindow = %d, want reported 1_000_000", usage.ContextWindow)
+	}
+	if usage.OutputTokens != 900 {
+		t.Errorf("OutputTokens = %d, want 900", usage.OutputTokens)
+	}
+	if pct := float64(usage.UsedTokens) * 100 / float64(usage.ContextWindow); pct > 30 {
+		t.Errorf("ctx %% = %.1f, want ~25%%", pct)
+	}
+
+	// Next turn's per-call snapshot keeps the reported window.
+	cs.handleAssistant(assistant)
+	if got := cs.GetContextUsage().ContextWindow; got != 1_000_000 {
+		t.Errorf("next turn: ContextWindow = %d, want 1_000_000", got)
+	}
+}
+
+func TestContextWindowFromModelUsage(t *testing.T) {
+	mu := map[string]any{
+		"claude-haiku-4-5-20251001": map[string]any{"contextWindow": float64(200_000)},
+		"claude-fable-5-1":          map[string]any{"contextWindow": float64(1_000_000)},
+		"broken":                    "not a map",
+	}
+	cases := []struct {
+		model string
+		want  int
+	}{
+		{"claude-fable-5-1", 1_000_000},
+		{"claude-fable-5-1[1m]", 1_000_000}, // alias suffix stripped before matching
+		{"CLAUDE-HAIKU-4-5-20251001", 200_000},
+		{"", 1_000_000},               // no model: largest wins
+		{"claude-unknown", 1_000_000}, // unmatched: largest wins (helpers are never bigger)
+	}
+	for _, c := range cases {
+		if got := contextWindowFromModelUsage(mu, c.model); got != c.want {
+			t.Errorf("model %q: got %d, want %d", c.model, got, c.want)
+		}
+	}
+	if got := contextWindowFromModelUsage(map[string]any{}, "x"); got != 0 {
+		t.Errorf("empty map: got %d, want 0", got)
+	}
+}
+
+func TestClaudeContextWindowGuess(t *testing.T) {
+	cases := map[string]int{
+		"":                     200_000,
+		"claude-opus-4-7":      200_000,
+		"claude-opus-4-7[1m]":  1_000_000,
+		"fable":                1_000_000,
+		"claude-fable-5-1":     1_000_000,
+		"claude-fable-5-1[1M]": 1_000_000,
+	}
+	for model, want := range cases {
+		if got := claudeContextWindow(model, 0); got != want {
+			t.Errorf("%q: got %d, want %d", model, got, want)
+		}
 	}
 }
