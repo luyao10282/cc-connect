@@ -253,6 +253,16 @@ func (a *Agent) Stop() error { return nil }
 // without it answer with an "unknown command" notice, which is harmless.
 func (a *Agent) CompressCommand() string { return "/compact" }
 
+// GetSessionHistory implements core.HistoryProvider. While ACP itself defines
+// no history retrieval RPC, backend sessions produced by agents like Kimi Code CLI
+// persist their transcripts locally (wire.jsonl). We attempt to read from known
+// storage roots so commands like /last and /history work right after a /switch.
+func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int) ([]core.HistoryEntry, error) {
+	return getKimiSessionHistory(sessionID, limit)
+}
+
+var _ core.HistoryProvider = (*Agent)(nil)
+
 // -- AgentDoctorInfo --
 
 func (a *Agent) CLIBinaryName() string {
