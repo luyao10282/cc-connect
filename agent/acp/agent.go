@@ -49,6 +49,11 @@ type Agent struct {
 	modesCache   []core.PermissionModeInfo
 	modesCurrent string
 
+	modelsMu      sync.RWMutex
+	modelsCache   []core.ModelOption
+	currentModel  string
+	activeSession atomic.Pointer[acpSession]
+
 	mu sync.RWMutex
 }
 
@@ -59,6 +64,8 @@ type Agent struct {
 type sessionCallbacks interface {
 	reportModes(block acpModesBlock)
 	reportListSupported(supported bool)
+	reportModels(current string, models []core.ModelOption)
+	reportActiveSession(s *acpSession)
 }
 
 // Ensure *Agent satisfies sessionCallbacks at compile time.
@@ -386,3 +393,58 @@ func (a *Agent) reportListSupported(supported bool) {
 		a.listUnsupported.Store(false)
 	}
 }
+
+func (a *Agent) reportModels(current string, models []core.ModelOption) {
+	if len(models) == 0 {
+		return
+	}
+	a.modelsMu.Lock()
+	a.modelsCache = models
+	if current != "" {
+		a.currentModel = current
+	}
+	a.modelsMu.Unlock()
+}
+
+func (a *Agent) reportActiveSession(s *acpSession) {
+	a.activeSession.Store(s)
+}
+
+// -- ModelSwitcher --
+
+func (a *Agent) GetModel() string {
+	a.modelsMu.RLock()
+	defer a.modelsMu.RUnlock()
+	if a.currentModel != "" {
+		return a.currentModel
+	}
+	if len(a.modelsCache) > 0 {
+		return a.modelsCache[0].Name
+	}
+	return ""
+}
+
+func (a *Agent) SetModel(model string) {
+	a.modelsMu.Lock()
+	a.currentModel = model
+	a.modelsMu.Unlock()
+
+	if sess := a.activeSession.Load(); sess != nil {
+		sess.SetLiveModel(model)
+	}
+}
+
+func (a *Agent) AvailableModels(_ context.Context) []core.ModelOption {
+	a.modelsMu.RLock()
+	if len(a.modelsCache) > 0 {
+		cached := make([]core.ModelOption, len(a.modelsCache))
+		copy(cached, a.modelsCache)
+		a.modelsMu.RUnlock()
+		return cached
+	}
+	a.modelsMu.RUnlock()
+
+	return loadKimiConfigModels()
+}
+
+var _ core.ModelSwitcher = (*Agent)(nil)
