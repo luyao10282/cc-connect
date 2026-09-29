@@ -81,6 +81,7 @@ type acpSessionConfig struct {
 	resumeSessionID string
 	authMethod      string
 	initialMode     string           // if non-empty, applied via session/set_mode after session/new
+	initialModel    string           // if non-empty, applied via session/set_config_option after handshake
 	callbacks       sessionCallbacks // may be nil
 }
 
@@ -159,6 +160,19 @@ func newACPSession(ctx context.Context, cfg acpSessionConfig) (*acpSession, erro
 		if ok := s.SetLiveMode(cfg.initialMode); !ok {
 			slog.Warn("acp: initial mode could not be applied",
 				"mode", cfg.initialMode,
+				"session_id", s.currentACPSessionID(),
+			)
+		}
+	}
+
+	// A model chosen via /model outlives the session it was set on (the
+	// engine closes the session on switch and starts a fresh one for the
+	// next turn), so re-apply it here: session/load would otherwise
+	// restore the model that was persisted when the session was created.
+	if strings.TrimSpace(cfg.initialModel) != "" {
+		if ok := s.SetLiveModel(cfg.initialModel); !ok {
+			slog.Warn("acp: initial model could not be applied",
+				"model", cfg.initialModel,
 				"session_id", s.currentACPSessionID(),
 			)
 		}

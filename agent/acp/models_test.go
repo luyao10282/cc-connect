@@ -79,3 +79,30 @@ model = "gemini-3.8-flash"
 		t.Errorf("missing file: got %+v, want nil", got)
 	}
 }
+
+// TestAgent_ModelOverrideSurvivesServerReport covers the /model switch flow:
+// the engine closes the session on switch, and the next handshake's
+// session/load reports the model persisted at creation time. That report
+// must not revert the user's override.
+func TestAgent_ModelOverrideSurvivesServerReport(t *testing.T) {
+	a := &Agent{}
+
+	a.SetModel("kimi-code/k3")
+
+	// Next session handshake: server reports the stale persisted model.
+	a.reportModels("genai/gemini-3.8-flash", []core.ModelOption{
+		{Name: "genai/gemini-3.8-flash", Alias: "Gemini"},
+		{Name: "kimi-code/k3", Alias: "K3"},
+	})
+
+	if got := a.GetModel(); got != "kimi-code/k3" {
+		t.Fatalf("GetModel after stale server report = %q, want override kimi-code/k3", got)
+	}
+	if a.modelOverride != "kimi-code/k3" {
+		t.Fatalf("modelOverride = %q, want kimi-code/k3", a.modelOverride)
+	}
+	// The model list itself must still refresh from the server.
+	if got := a.AvailableModels(context.Background()); len(got) != 2 {
+		t.Fatalf("AvailableModels = %+v, want 2 server models", got)
+	}
+}

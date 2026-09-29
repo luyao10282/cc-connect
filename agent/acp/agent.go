@@ -49,9 +49,16 @@ type Agent struct {
 	modesCache   []core.PermissionModeInfo
 	modesCurrent string
 
-	modelsMu      sync.RWMutex
-	modelsCache   []core.ModelOption
-	currentModel  string
+	modelsMu     sync.RWMutex
+	modelsCache  []core.ModelOption
+	currentModel string
+	// modelOverride is set only by SetModel (a user-initiated /model
+	// switch). It must survive session restarts: the engine closes the
+	// session on switch, and the next handshake's session/load would
+	// otherwise report the model persisted at creation time and silently
+	// revert the user's choice.
+	modelOverride string
+
 	activeSession atomic.Pointer[acpSession]
 
 	mu sync.RWMutex
@@ -240,6 +247,10 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	extra = append(extra, a.sessionEnv...)
 	a.mu.RUnlock()
 
+	a.modelsMu.RLock()
+	pendingModel := a.modelOverride
+	a.modelsMu.RUnlock()
+
 	return newACPSession(ctx, acpSessionConfig{
 		command:         command,
 		args:            allArgs,
@@ -248,6 +259,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 		resumeSessionID: sessionID,
 		authMethod:      authMethod,
 		initialMode:     pendingMode,
+		initialModel:    pendingModel,
 		callbacks:       a,
 	})
 }
@@ -400,7 +412,9 @@ func (a *Agent) reportModels(current string, models []core.ModelOption) {
 	}
 	a.modelsMu.Lock()
 	a.modelsCache = models
-	if current != "" {
+	// A server-reported current value (e.g. restored by session/load after
+	// a restart) must not clobber an explicit /model override.
+	if current != "" && a.modelOverride == "" {
 		a.currentModel = current
 	}
 	a.modelsMu.Unlock()
@@ -427,6 +441,7 @@ func (a *Agent) GetModel() string {
 func (a *Agent) SetModel(model string) {
 	a.modelsMu.Lock()
 	a.currentModel = model
+	a.modelOverride = model
 	a.modelsMu.Unlock()
 
 	if sess := a.activeSession.Load(); sess != nil {
