@@ -65,6 +65,16 @@ type acpSession struct {
 	// to the platform instead of buffering them until the next turn.
 	promptInFlight atomic.Int32
 
+	// replayInFlight tracks an in-flight session/load. The agent replays the
+	// session history as session/update notifications before the load
+	// response settles; those mapped events must NOT go to s.events, because
+	// the engine only starts draining that channel after the handshake
+	// returns — on long histories the buffer (cap 128) fills, the transport
+	// pump blocks in emit, the agent blocks on a full stdout pipe, and the
+	// load response never arrives (deadlock). State absorption (tool inputs,
+	// modes, usage) still runs during replay; only emission is suppressed.
+	replayInFlight atomic.Int32
+
 	callbacks sessionCallbacks // may be nil (tests, integration harness)
 }
 
@@ -253,7 +263,15 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 			"cwd":        s.workDir,
 			"mcpServers": []any{},
 		}
-		loadRes, err := s.tr.call(s.ctx, "session/load", loadParams)
+		// Bound the load: a session persisted mid-turn (e.g. its process was
+		// force-killed) can make the agent replay history and then never
+		// answer, which previously hung the resume forever. On timeout we fall
+		// through to session/new below — same as any other load failure.
+		s.replayInFlight.Add(1)
+		loadCtx, loadCancel := context.WithTimeout(s.ctx, 90*time.Second)
+		loadRes, err := s.tr.call(loadCtx, "session/load", loadParams)
+		loadCancel()
+		s.replayInFlight.Add(-1)
 		if err != nil {
 			slog.Warn("acp: session/load failed, starting new session", "error", err)
 		} else {
@@ -262,8 +280,17 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 				Modes         *acpModesBlock    `json:"modes"`
 				ConfigOptions []acpConfigOption `json:"configOptions"`
 			}
-			if json.Unmarshal(loadRes, &lr) == nil && lr.SessionID != "" {
-				s.setACPSessionID(lr.SessionID)
+			if json.Unmarshal(loadRes, &lr) == nil {
+				// kimi acp omits sessionId from the load response — the
+				// client already knows which session it asked to load, so an
+				// error-free reply means that session is now live. Falling
+				// through to session/new here would silently discard the
+				// freshly loaded history.
+				sid := lr.SessionID
+				if sid == "" {
+					sid = resumeSessionID
+				}
+				s.setACPSessionID(sid)
 				s.absorbModes(lr.Modes)
 				s.absorbConfigOptions(lr.ConfigOptions)
 				return nil
@@ -485,6 +512,12 @@ func (s *acpSession) onNotification(method string, params json.RawMessage) {
 	sid := s.currentACPSessionID()
 	// Debug log to capture raw session/update JSON for troubleshooting vendor compatibility
 	slog.Debug("acp: session/update", "session_id", sid, "params", string(params))
+	if s.replayInFlight.Load() > 0 {
+		// History replay during session/load: absorb-only, never emit (see
+		// replayInFlight). The engine re-reads history via HistoryProvider
+		// for /last and /history, so dropping replay events loses nothing.
+		return
+	}
 	hasVisible := false
 	for _, ev := range mapSessionUpdate(sid, params) {
 		if ev.Type == core.EventText && ev.Content != "" {
