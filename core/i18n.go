@@ -225,6 +225,7 @@ const (
 	MsgPermissionApproveAll      MsgKey = "permission_approve_all"
 	MsgPermissionDenied          MsgKey = "permission_denied_msg"
 	MsgPermissionHint            MsgKey = "permission_hint"
+	MsgPermissionTimeout         MsgKey = "permission_timeout"
 	MsgQuietOn                   MsgKey = "quiet_on"
 	MsgQuietOff                  MsgKey = "quiet_off"
 	MsgDisplayModeCompact        MsgKey = "display_mode_compact"
@@ -927,6 +928,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "❌ 已拒絕。Agent 將停止此工具使用。",
 		LangJapanese:           "❌ 拒否しました。エージェントはこのツールの使用を中止します。",
 		LangSpanish:            "❌ Denegado. El agente detendrá el uso de esta herramienta.",
+	},
+	MsgPermissionTimeout: {
+		LangEnglish:            "⏱️ Permission request for **%s** timed out after %v with no response — auto-denied; the agent will continue without it.",
+		LangChinese:            "⏱️ **%s** 的权限请求超过 %v 未响应，已自动拒绝，Agent 将跳过该操作继续。",
+		LangTraditionalChinese: "⏱️ **%s** 的權限請求超過 %v 未回應，已自動拒絕，Agent 將跳過該操作繼續。",
+		LangJapanese:           "⏱️ **%s** の権限リクエストが %v 応答なしでタイムアウトしたため自動拒否しました。エージェントは処理を続行します。",
+		LangSpanish:            "⏱️ La solicitud de permiso para **%s** expiró tras %v sin respuesta: denegada automáticamente; el agente continuará.",
 	},
 	MsgPermissionHint: {
 		LangEnglish:            "⚠️ Waiting for permission response. Reply **allow** / **deny** / **allow all**.",

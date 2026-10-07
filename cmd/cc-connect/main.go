@@ -697,6 +697,11 @@ func main() {
 			engine.SetMaxTurnTime(time.Duration(*cfg.MaxTurnTimeMins) * time.Minute)
 		}
 
+		// Wire permission wait timeout (auto-deny unanswered prompts; 0 = disabled)
+		if cfg.PermissionTimeoutMins != nil && *cfg.PermissionTimeoutMins > 0 {
+			engine.SetPermissionTimeout(time.Duration(*cfg.PermissionTimeoutMins) * time.Minute)
+		}
+
 		// Wire queue depth
 		if cfg.Queue.MaxDepth != nil && *cfg.Queue.MaxDepth > 0 {
 			engine.SetMaxQueuedMessages(*cfg.Queue.MaxDepth)

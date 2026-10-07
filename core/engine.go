@@ -415,6 +415,10 @@ type Engine struct {
 	eventIdleTimeout    time.Duration
 	staleLockBreakAfter time.Duration // busy-lock stale-break threshold; 0 disables
 	maxTurnTime         time.Duration // absolute wall-clock cap per turn (0 = disabled)
+	// permissionTimeout auto-denies a permission request that stays unanswered
+	// this long, so a forgotten prompt cannot stall the turn until maxTurnTime
+	// (or forever) — the agent receives the deny and continues. 0 = disabled.
+	permissionTimeout time.Duration
 	// agentSessionIdleTimeoutNanos 在单轮正常结束后关闭空闲的 live agent 进程，
 	// 同时保留已保存的 session ID，便于下次继续恢复。
 	agentSessionIdleTimeoutNanos atomic.Int64
@@ -1412,6 +1416,13 @@ func (e *Engine) SetMaxTurnTime(d time.Duration) {
 // agent process before the next incoming message breaks it. 0 disables.
 func (e *Engine) SetStaleLockBreakAfter(d time.Duration) {
 	e.staleLockBreakAfter = d
+}
+
+// SetPermissionTimeout sets how long a permission request may stay unanswered
+// before the engine auto-denies it and lets the turn continue. 0 disables the
+// timeout (default): prompts wait for the user indefinitely.
+func (e *Engine) SetPermissionTimeout(d time.Duration) {
+	e.permissionTimeout = d
 }
 
 // SetEventIdleTimeout sets the maximum time to wait between consecutive agent events.
@@ -5274,6 +5285,60 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		turnDeadlineCh = turnDeadlineTimer.C
 	}
 
+	// handleTurnDeadline runs the max_turn_time two-phase shutdown. It is a
+	// closure so the permission-wait path (EventPermissionRequest) can invoke
+	// the exact same handling: the deadline must stay armed while the engine
+	// is blocked waiting for a user's permission answer, otherwise a forgotten
+	// prompt stalls the turn indefinitely and the timer fires hours late.
+	handleTurnDeadline := func() {
+		elapsed := time.Since(turnStart)
+		slog.Warn("agent turn exceeded max_turn_time: sending stop signal, will force-kill if needed",
+			"session_key", sessionKey, "max_turn_time", e.maxTurnTime, "elapsed", elapsed)
+		cp.Finalize(ProgressCardStateFailed)
+		sp.discard()
+		state.mu.Lock()
+		p := state.platform
+		state.mu.Unlock()
+		e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError),
+			fmt.Sprintf("agent turn exceeded maximum time (%v), stopping", e.maxTurnTime)))
+
+		// Two-phase shutdown: first try a graceful stop so the agent can
+		// write its final state before dying (preserves --resume ability).
+		// If it doesn't exit within a short grace window, force-kill.
+		state.markStopped()
+		gracePeriod := 10 * time.Second
+		graceTimer := time.NewTimer(gracePeriod)
+	graceLoop:
+		for {
+			select {
+			case evt, ok := <-state.agentSession.Events():
+				if !ok || (ok && evt.Done) {
+					// Agent exited cleanly; state is intact, resume will work.
+					slog.Info("agent exited gracefully after max_turn_time stop signal",
+						"session_key", sessionKey, "elapsed", time.Since(turnStart))
+					graceTimer.Stop()
+					state.mu.Lock()
+					state.eventsNeedResync = false
+					state.mu.Unlock()
+					break graceLoop
+				}
+			case <-graceTimer.C:
+				// Agent did not stop within grace period — force-kill.
+				slog.Error("agent did not stop within grace period after max_turn_time; force-killing",
+					"session_key", sessionKey, "grace_period", gracePeriod)
+				graceTimer.Stop()
+				state.mu.Lock()
+				state.eventsNeedResync = true
+				state.mu.Unlock()
+				e.cleanupInteractiveState(sessionKey, state)
+				return
+			}
+		}
+		// Graceful exit path: cleanupInteractiveState closes the session,
+		// but eventsNeedResync=false so the next --resume works correctly.
+		e.cleanupInteractiveState(sessionKey, state)
+	}
+
 	events := state.agentSession.Events()
 	stopCh := state.stopSignal()
 	for {
@@ -5321,52 +5386,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			e.cleanupInteractiveState(sessionKey, state)
 			return
 		case <-turnDeadlineCh:
-			elapsed := time.Since(turnStart)
-			slog.Warn("agent turn exceeded max_turn_time: sending stop signal, will force-kill if needed",
-				"session_key", sessionKey, "max_turn_time", e.maxTurnTime, "elapsed", elapsed)
-			cp.Finalize(ProgressCardStateFailed)
-			sp.discard()
-			state.mu.Lock()
-			p := state.platform
-			state.mu.Unlock()
-			e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError),
-				fmt.Sprintf("agent turn exceeded maximum time (%v), stopping", e.maxTurnTime)))
-
-			// Two-phase shutdown: first try a graceful stop so the agent can
-			// write its final state before dying (preserves --resume ability).
-			// If it doesn't exit within a short grace window, force-kill.
-			state.markStopped()
-			gracePeriod := 10 * time.Second
-			graceTimer := time.NewTimer(gracePeriod)
-		graceLoop:
-			for {
-				select {
-				case evt, ok := <-state.agentSession.Events():
-					if !ok || (ok && evt.Done) {
-						// Agent exited cleanly; state is intact, resume will work.
-						slog.Info("agent exited gracefully after max_turn_time stop signal",
-							"session_key", sessionKey, "elapsed", time.Since(turnStart))
-						graceTimer.Stop()
-						state.mu.Lock()
-						state.eventsNeedResync = false
-						state.mu.Unlock()
-						break graceLoop
-					}
-				case <-graceTimer.C:
-					// Agent did not stop within grace period — force-kill.
-					slog.Error("agent did not stop within grace period after max_turn_time; force-killing",
-						"session_key", sessionKey, "grace_period", gracePeriod)
-					graceTimer.Stop()
-					state.mu.Lock()
-					state.eventsNeedResync = true
-					state.mu.Unlock()
-					e.cleanupInteractiveState(sessionKey, state)
-					return
-				}
-			}
-			// Graceful exit path: cleanupInteractiveState closes the session,
-			// but eventsNeedResync=false so the next --resume works correctly.
-			e.cleanupInteractiveState(sessionKey, state)
+			handleTurnDeadline()
 			return
 		case <-e.ctx.Done():
 			state.mu.Lock()
@@ -5920,8 +5940,49 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				idleTimer.Stop()
 			}
 
-			<-pending.Resolved
-			slog.Info("permission resolved", "request_id", event.RequestID)
+			// Wait for the user's decision, but never let a forgotten prompt
+			// stall the turn: an unanswered request auto-denies after
+			// permissionTimeout (the agent receives the deny and continues),
+			// and the turn's absolute deadline stays armed while waiting —
+			// previously this blocking read made max_turn_time blind until
+			// the user responded, so a prompt left overnight was killed hours
+			// late, right after the user finally answered.
+			var permTimer *time.Timer
+			var permTimeoutCh <-chan time.Time
+			if e.permissionTimeout > 0 {
+				permTimer = time.NewTimer(e.permissionTimeout)
+				permTimeoutCh = permTimer.C
+			}
+			select {
+			case <-pending.Resolved:
+				slog.Info("permission resolved", "request_id", event.RequestID)
+			case <-permTimeoutCh:
+				slog.Warn("permission request timed out, auto-denying",
+					"request_id", event.RequestID, "tool", event.ToolName, "timeout", e.permissionTimeout)
+				if err := state.agentSession.RespondPermission(event.RequestID, PermissionResult{
+					Behavior: "deny",
+					Message:  fmt.Sprintf("permission request timed out after %v without a user response", e.permissionTimeout),
+				}); err != nil {
+					slog.Error("failed to auto-deny timed-out permission request", "error", err, "request_id", event.RequestID)
+				}
+				state.mu.Lock()
+				if state.pending == pending {
+					state.pending = nil
+				}
+				state.mu.Unlock()
+				pending.resolve()
+				e.send(p, replyCtx, e.i18n.Tf(MsgPermissionTimeout, event.ToolName, e.permissionTimeout))
+			case <-turnDeadlineCh:
+				if permTimer != nil {
+					permTimer.Stop()
+				}
+				pending.resolve()
+				handleTurnDeadline()
+				return
+			}
+			if permTimer != nil {
+				permTimer.Stop()
+			}
 
 			// The stream preview was frozen+detached when this permission
 			// request was emitted, so any subsequent EventText in this turn

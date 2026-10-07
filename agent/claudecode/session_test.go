@@ -1440,6 +1440,9 @@ func TestHandleResultKeepsLiveAssistantUsage(t *testing.T) {
 	}
 	if u.OutputTokens != 406 {
 		t.Errorf("OutputTokens = %d, want 406 (result is authoritative for output)", u.OutputTokens)
+	}
+}
+
 // A model id without the "[1m]" suffix used to be assumed 200k even when the
 // CLI's result event said otherwise, so a Fable session past 200k rendered
 // ctx 100%. The reported window must win over the id-based guess, both for

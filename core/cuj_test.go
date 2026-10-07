@@ -158,9 +158,16 @@ type cujAgentSession struct {
 	pendingDelayMs int
 
 	// observed
-	sentPrompts []string
-	sentImages  [][]ImageAttachment
-	closeCount  int
+	sentPrompts   []string
+	sentImages    [][]ImageAttachment
+	closeCount    int
+	permResponses []cujPermResponse
+}
+
+// cujPermResponse records one RespondPermission call the engine made.
+type cujPermResponse struct {
+	RequestID string
+	Result    PermissionResult
 }
 
 // atomic_bool is intentionally lowercase to avoid clash with stdlib atomic.Bool
@@ -225,10 +232,15 @@ func (s *cujAgentSession) Send(prompt string, _ string, images []ImageAttachment
 	}()
 	return nil
 }
-func (s *cujAgentSession) RespondPermission(_ string, _ PermissionResult) error { return nil }
-func (s *cujAgentSession) Events() <-chan Event                                 { return s.events }
-func (s *cujAgentSession) CurrentSessionID() string                             { return "cuj-agent-session" }
-func (s *cujAgentSession) Alive() bool                                          { return !s.closed.Get() }
+func (s *cujAgentSession) RespondPermission(requestID string, result PermissionResult) error {
+	s.mu.Lock()
+	s.permResponses = append(s.permResponses, cujPermResponse{RequestID: requestID, Result: result})
+	s.mu.Unlock()
+	return nil
+}
+func (s *cujAgentSession) Events() <-chan Event     { return s.events }
+func (s *cujAgentSession) CurrentSessionID() string { return "cuj-agent-session" }
+func (s *cujAgentSession) Alive() bool              { return !s.closed.Get() }
 func (s *cujAgentSession) Close() error {
 	s.closed.Set(true)
 	s.mu.Lock()
@@ -264,6 +276,24 @@ func (s *cujAgentSession) getSentImages() [][]ImageAttachment {
 		out[i] = cloneCUJImages(images)
 	}
 	return out
+}
+
+func (s *cujAgentSession) getPermResponses() []cujPermResponse {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]cujPermResponse, len(s.permResponses))
+	copy(out, s.permResponses)
+	return out
+}
+
+// firstSession returns the first session this agent started, or nil.
+func (a *cujAgent) firstSession() *cujAgentSession {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.sessions) == 0 {
+		return nil
+	}
+	return a.sessions[0]
 }
 
 // ---------------------------------------------------------------------------
@@ -2550,4 +2580,135 @@ func TestCUJ_H5_WorkspaceSkillDiscoveryAndInvocation(t *testing.T) {
 	e.ReceiveMessage(p, skillMessage(p.Name(), "a", "/skills"))
 	sent := p.getSent()
 	assertWorkspaceSkills(t, sent[len(sent)-1], "b", "a")
+}
+
+// ===========================================================================
+// CUJ-PERM-1 · A permission prompt left unanswered (user asleep / away) must
+// not stall the turn. With SetPermissionTimeout armed, the engine auto-denies
+// the request, tells the user, and the agent continues the same turn.
+// Regression for the incident where an overnight rm -rf approval blocked the
+// turn for 7.5h until the user answered in the morning — and the turn was
+// then force-killed by max_turn_time one second later.
+//
+// User journey: (1) send prompt, (2) see the permission card, (3) do nothing
+// and still see the turn complete with an auto-deny notice.
+// ===========================================================================
+
+func TestCUJ_PERM1_PermissionTimeoutAutoDeny(t *testing.T) {
+	env := newCUJStreamingEnv(t)
+	env.engine.SetPermissionTimeout(150 * time.Millisecond)
+
+	preText := "intro before the risky command"
+	postText := "denied, continuing another way"
+	finalText := "final answer after auto-deny"
+	env.agent.setNextSessionEvents([]Event{
+		{Type: EventText, Content: preText},
+		{Type: EventPermissionRequest, ToolName: "Bash", RequestID: "req-perm-timeout-1", ToolInput: "rm -rf /tmp/x"},
+		{Type: EventText, Content: postText},
+		{Type: EventResult, Content: finalText, Done: true},
+	}, 0)
+
+	plat := env.streamingPlat()
+
+	// === User action 1: send a prompt. ===
+	env.sendStreaming("jack", "clean up my temp dir")
+
+	// === User observation 1: the permission card arrives. ===
+	env.waitFor("permission card sent", 2*time.Second, func() bool {
+		for _, m := range plat.getSent() {
+			if strings.Contains(m, "Bash") && strings.Contains(m, "rm -rf") {
+				return true
+			}
+		}
+		return false
+	})
+
+	// === User action 2: nothing — the user is away. The engine must answer
+	// for them: the agent receives a deny for the exact request id. ===
+	env.waitFor("auto-deny delivered to agent", 2*time.Second, func() bool {
+		s := env.agent.firstSession()
+		if s == nil {
+			return false
+		}
+		for _, pr := range s.getPermResponses() {
+			if pr.RequestID == "req-perm-timeout-1" && pr.Result.Behavior == "deny" {
+				return true
+			}
+		}
+		return false
+	})
+
+	// === User observation 2: the timeout notice is visible. ===
+	env.waitFor("timeout notice sent", 2*time.Second, func() bool {
+		for _, m := range plat.getSent() {
+			if strings.Contains(m, "timed out") {
+				return true
+			}
+		}
+		return false
+	})
+
+	// === User observation 3: the turn continues and finishes. With the
+	// stream preview active, the final answer lands via UpdateMessage; the
+	// plain-Send fallback is accepted too (same as CUJ-STREAM-1). ===
+	env.waitFor("final answer delivered", 2*time.Second, func() bool {
+		if env.sentContains(finalText) {
+			return true
+		}
+		for _, u := range plat.getPreviewUpdates() {
+			if strings.Contains(u.Content, finalText) {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// ===========================================================================
+// CUJ-PERM-2 · The max_turn_time deadline must stay armed while the engine is
+// blocked waiting for a permission answer. Pre-fix, the blocking
+// <-pending.Resolved read made the deadline blind: it only fired after the
+// user finally responded, hours late, killing the turn one second after the
+// long-awaited answer. Here nobody ever answers; the deadline notice must
+// appear on its own.
+//
+// User journey: (1) send prompt, (2) see the permission card, (3) do nothing
+// and see the turn stopped by the deadline.
+// ===========================================================================
+
+func TestCUJ_PERM2_TurnDeadlineFiresDuringPermissionWait(t *testing.T) {
+	env := newCUJStreamingEnv(t)
+	env.engine.SetMaxTurnTime(200 * time.Millisecond)
+
+	env.agent.setNextSessionEvents([]Event{
+		{Type: EventText, Content: "working on it"},
+		{Type: EventPermissionRequest, ToolName: "Bash", RequestID: "req-perm-deadline-1", ToolInput: "rm -rf /tmp/x"},
+		// No further events: the agent sits waiting for the answer forever.
+	}, 0)
+
+	plat := env.streamingPlat()
+
+	// === User action 1: send a prompt. ===
+	env.sendStreaming("jack", "do a risky thing")
+
+	// === User observation 1: the permission card arrives. ===
+	env.waitFor("permission card sent", 2*time.Second, func() bool {
+		for _, m := range plat.getSent() {
+			if strings.Contains(m, "Bash") && strings.Contains(m, "rm -rf") {
+				return true
+			}
+		}
+		return false
+	})
+
+	// === User action 2: nothing. The deadline must fire without any answer
+	// (pre-fix this only happened after a response, arbitrarily late). ===
+	env.waitFor("deadline notice sent", 3*time.Second, func() bool {
+		for _, m := range plat.getSent() {
+			if strings.Contains(m, "exceeded maximum time") {
+				return true
+			}
+		}
+		return false
+	})
 }
