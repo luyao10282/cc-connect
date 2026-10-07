@@ -272,6 +272,13 @@ func (a *Agent) Stop() error { return nil }
 // without it answer with an "unknown command" notice, which is harmless.
 func (a *Agent) CompressCommand() string { return "/compact" }
 
+// CompressAsync implements core.AsyncContextCompressor. kimi acp's /compact
+// builtin is fire-and-forget: it settles the prompt turn with an ack and
+// runs compaction as a background LLM task, reporting "Compaction completed"
+// later as an out-of-turn chunk (which this client closes with a synthetic
+// EventResult when no prompt is in flight — see acpSession.onNotification).
+func (a *Agent) CompressAsync() bool { return true }
+
 // GetSessionHistory implements core.HistoryProvider. While ACP itself defines
 // no history retrieval RPC, backend sessions produced by agents like Kimi Code CLI
 // persist their transcripts locally (wire.jsonl). We attempt to read from known

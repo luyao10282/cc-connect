@@ -531,6 +531,18 @@ type ContextCompressor interface {
 	CompressCommand() string
 }
 
+// AsyncContextCompressor is an optional interface for agents whose compress
+// command only STARTS background compaction: the command's prompt turn
+// settles immediately with an ack, and completion is reported later as an
+// out-of-turn chunk (e.g. kimi acp's "Compaction completed"). When
+// CompressAsync returns true, the engine keeps the session locked after the
+// ack — new messages queue as they do during a busy turn — until the
+// completion chunk arrives, so it is delivered standalone rather than
+// poisoning or folding into the next foreground turn.
+type AsyncContextCompressor interface {
+	CompressAsync() bool
+}
+
 // AgentSessionCanceller is an optional interface for agent sessions that support
 // cancelling the current turn without terminating the session or its underlying
 // process. When implemented, the engine calls CancelTurn instead of Close() for

@@ -10875,6 +10875,22 @@ func (e *Engine) runCompress(state *interactiveState, session *Session, sessions
 	// Stop unsolicited reader before taking event channel ownership.
 	e.stopUnsolicitedReader(state)
 
+	// ...and restart it on every exit path. kimi acp settles the /compact
+	// prompt immediately and reports "Compaction completed" as an
+	// out-of-turn chunk when the background compaction finishes — with no
+	// reader running, that chunk (plus its synthetic EventResult) sits in
+	// the event buffer and is consumed by the next foreground turn as its
+	// instant, wrong result. Mirrors the alive-check in drainOrphanedQueue.
+	defer func() {
+		state.mu.Lock()
+		alive := state.agentSession != nil && state.agentSession.Alive() && !state.stopped && !state.eventsNeedResync
+		wsDir := state.workspaceDir
+		state.mu.Unlock()
+		if alive {
+			e.startUnsolicitedReader(state, session, sessions, iKey, wsDir)
+		}
+	}()
+
 	state.mu.Lock()
 	state.platform = p
 	state.replyCtx = replyCtx
@@ -10904,6 +10920,13 @@ func (e *Engine) runCompress(state *interactiveState, session *Session, sessions
 	e.processCompressEvents(state, session, sessions, iKey, p, replyCtx, &compressUnlocked, auto, lockGen)
 }
 
+// compressBackgroundTimeout bounds how long processCompressEvents waits for
+// an async-compress agent's out-of-turn completion chunk after the ack. On
+// expiry the session is released anyway; the late chunk is then relayed by
+// the unsolicited reader (restarted by runCompress's defer) as a standalone
+// message, so a stuck or failed compaction cannot wedge the session forever.
+const compressBackgroundTimeout = 15 * time.Minute
+
 // processCompressEvents drains agent events after a compress command.
 // Unlike processInteractiveEvents it does NOT record history and treats
 // an empty result as success rather than "(empty response)".
@@ -10920,6 +10943,17 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 		defer idleTimer.Stop()
 		idleCh = idleTimer.C
 	}
+
+	// ackPending is true while an async-compress agent's immediate ack turn
+	// has not settled yet. Such agents (kimi acp) only START background
+	// compaction with /compact and report completion later as an out-of-turn
+	// chunk closed by a synthetic EventResult; see AsyncContextCompressor.
+	ackPending := false
+	if ac, ok := e.agent.(AsyncContextCompressor); ok {
+		ackPending = ac.CompressAsync()
+	}
+	var bgTimer *time.Timer
+	var bgDeadline <-chan time.Time
 
 	for {
 		var event Event
@@ -10949,6 +10983,14 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 			e.notifyDroppedQueuedMessages(state, fmt.Errorf("compress timed out"))
 			return
 		case <-e.ctx.Done():
+			return
+		case <-bgDeadline:
+			slog.Warn("compress: async compaction completion wait timed out, releasing session",
+				"session", sessionKey, "timeout", compressBackgroundTimeout)
+			if !auto && len(textParts) > 0 {
+				e.send(p, replyCtx, strings.Join(textParts, ""))
+			}
+			e.drainQueuedMessagesAfterCompress(state, session, sessions, sessionKey, unlocked, lockGen)
 			return
 		}
 
@@ -10991,6 +11033,27 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 			if result == "" && len(textParts) > 0 {
 				result = strings.Join(textParts, "")
 			}
+			if ackPending {
+				// Async compress: this first result is only the ack
+				// ("Context compaction started…"). Keep the session locked
+				// — new messages queue like they do during a busy turn —
+				// and wait for the out-of-turn completion chunk (closed by
+				// a synthetic EventResult) so it is delivered standalone
+				// instead of folding into the next turn's reply.
+				ackPending = false
+				if compressAckStartedCompaction(result) {
+					if !auto && result != "" {
+						e.send(p, replyCtx, result)
+					}
+					textParts = textParts[:0]
+					bgTimer = time.NewTimer(compressBackgroundTimeout)
+					defer bgTimer.Stop()
+					bgDeadline = bgTimer.C
+					continue
+				}
+				// Refusal ack (nothing runs in the background): fall
+				// through to the normal completion path.
+			}
 			if !auto {
 				if result != "" {
 					e.send(p, replyCtx, result)
@@ -11022,6 +11085,17 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 			})
 		}
 	}
+}
+
+// compressAckStartedCompaction reports whether an async-compress agent's ack
+// means background compaction really launched (so a completion chunk will
+// follow), versus a local refusal that ends the flow with the ack itself.
+// Matches kimi acp's two refusal shapes: "/compact failed: …" (engine threw,
+// e.g. turn active or empty history) and "Unknown ACP command: …" (server
+// without a /compact builtin).
+func compressAckStartedCompaction(ack string) bool {
+	return !strings.HasPrefix(ack, "/compact failed") &&
+		!strings.HasPrefix(ack, "Unknown")
 }
 
 // drainQueuedMessagesAfterCompress processes any messages that were queued

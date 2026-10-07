@@ -10490,6 +10490,149 @@ func TestCmdCompress_DrainsQueueAfterSuccess(t *testing.T) {
 	}
 }
 
+// --- async compress (agent only starts background compaction) ---
+
+type stubAsyncCompressorAgent struct {
+	stubCompressorAgent
+}
+
+func (a *stubAsyncCompressorAgent) CompressAsync() bool { return true }
+
+func waitForSendCalls(t *testing.T, sess *queuingAgentSession, want int, what string) {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for {
+		sess.sendMu.Lock()
+		n := len(sess.sendCalls)
+		sess.sendMu.Unlock()
+		if n >= want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s (sendCalls=%d, want=%d)", what, n, want)
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+}
+
+func waitForSentSubstr(t *testing.T, p *stubPlatformEngine, substr string) {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for {
+		found := false
+		for _, s := range p.getSent() {
+			if strings.Contains(s, substr) {
+				found = true
+			}
+		}
+		if found {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %q in sent messages, sent = %v", substr, p.getSent())
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
+func TestCmdCompress_AsyncWaitsForBackgroundCompletion(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("compress-async")
+	agent := &stubAsyncCompressorAgent{stubCompressorAgent{cmd: "/compact"}}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+		pendingMessages: []queuedMessage{
+			{platform: p, replyCtx: "ctx-q1", content: "msg-sent-during-compaction"},
+		},
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	msg := &Message{SessionKey: key, Content: "/compress", ReplyCtx: "ctx"}
+	e.cmdCompress(p, msg)
+
+	// The /compact command itself goes out first.
+	waitForSendCalls(t, sess, 1, "compress command send")
+
+	// Ack settles: background compaction started, but nothing is done yet.
+	sess.events <- Event{Type: EventResult, Content: "Context compaction started — it runs in the background", Done: true}
+	waitForSentSubstr(t, p, "Context compaction started")
+
+	// While compaction runs in the background the queued message must NOT
+	// be sent — the session stays locked as if a turn were busy.
+	time.Sleep(150 * time.Millisecond)
+	sess.sendMu.Lock()
+	n := len(sess.sendCalls)
+	sess.sendMu.Unlock()
+	if n != 1 {
+		t.Fatalf("expected queued message to wait for background completion, sendCalls=%d", n)
+	}
+
+	// Background completion arrives as an out-of-turn chunk + synthetic result.
+	sess.events <- Event{Type: EventText, Content: "Compaction completed."}
+	sess.events <- Event{Type: EventResult, Content: "", Done: true}
+
+	// The summary is delivered standalone, then the queued message drains.
+	waitForSentSubstr(t, p, "Compaction completed.")
+	waitForSendCalls(t, sess, 2, "queued message drained after completion")
+
+	sess.sendMu.Lock()
+	drained := sess.sendCalls[1]
+	sess.sendMu.Unlock()
+	if !strings.Contains(drained, "msg-sent-during-compaction") {
+		t.Fatalf("expected queued message content in second send, got %q", drained)
+	}
+
+	// Let the drained turn finish.
+	sess.events <- Event{Type: EventResult, Content: "drain-done", Done: true}
+}
+
+func TestCmdCompress_AsyncRefusalDoesNotWait(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("compress-async-refused")
+	agent := &stubAsyncCompressorAgent{stubCompressorAgent{cmd: "/compact"}}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+		pendingMessages: []queuedMessage{
+			{platform: p, replyCtx: "ctx-q1", content: "msg-after-refused-compress"},
+		},
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	msg := &Message{SessionKey: key, Content: "/compress", ReplyCtx: "ctx"}
+	e.cmdCompress(p, msg)
+
+	waitForSendCalls(t, sess, 1, "compress command send")
+
+	// A refusal ack ("/compact failed: …") means nothing runs in the
+	// background — the flow must finish with the ack, not wait for a
+	// completion chunk that will never come.
+	sess.events <- Event{Type: EventResult, Content: "/compact failed: Cannot compact while a turn is active", Done: true}
+
+	waitForSentSubstr(t, p, "/compact failed")
+	waitForSendCalls(t, sess, 2, "queued message drained after refusal")
+
+	// Let the drained turn finish.
+	sess.events <- Event{Type: EventResult, Content: "drain-done", Done: true}
+}
+
 // --- cmdPs ---
 
 func TestCmdPs_EmptyArgs_RepliesUsage(t *testing.T) {
